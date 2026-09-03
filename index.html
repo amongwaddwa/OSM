@@ -26,11 +26,16 @@
       <button id="ble">Anslut G30-NAV</button>
       <button id="locate">Centrera på mig</button>
       <button id="clear">Rensa rutt</button>
+      <select id="zoomMode" style="border:0;border-radius:12px;padding:12px 14px;font-size:16px;background:#24343d;color:white">
+        <option value="close">Kartzoom: nära</option>
+        <option value="normal" selected>Kartzoom: normal</option>
+        <option value="far">Kartzoom: långt</option>
+      </select>
     </div>
     <div class="status">
       <div><strong id="state">Inte ansluten</strong></div>
       <div id="instruction">Tryck på kartan för att välja destination.</div>
-      <div class="muted">OpenStreetMap på mobilen. Rutt + svänginformation skickas med Bluetooth till ESP32-skärmen.</div>
+      <div class="muted">Rage-inspirerat navläge: OpenStreetMap-vägar, nästa sväng, destinationriktning, ankomsttid och återstående sträcka skickas via Bluetooth till ESP32-skärmen.</div>
     </div>
   </div>
 
@@ -52,10 +57,29 @@ let stepIndex = 0;
 let lastRouteRequest = 0;
 let lastBleSend = 0;
 
+// Nearby OSM roads for the scooter display.
+let nearbyRoadWays = [];
+let lastRoadFetch = 0;
+let lastRoadFetchPos = null;
+let lastRoadSend = 0;
+let roadFetchInFlight = false;
+let roadSendInFlight = false;
+
+const DISPLAY_ROAD_RADIUS_M = 220;
+const DISPLAY_MAX_ROADS = 16;
+const DISPLAY_MAX_POINTS_PER_ROAD = 10;
+
+// The ESP32 map is deliberately quite close:
+// roughly 180 m wide, with more space in front of the rider than behind.
+let VIEW_METERS_PER_X_UNIT = 1.8;
+let VIEW_METERS_PER_Y_UNIT = 1.7;
+const VIEW_RIDER_X = 50;
+const VIEW_RIDER_Y = 72;
+
 const stateEl = document.getElementById('state');
 const instrEl = document.getElementById('instruction');
 
-const map = L.map('map', { zoomControl:true }).setView([59.3293, 18.0686], 13);
+const map = L.map('map', { zoomControl:true }).setView([59.3293, 18.0686], 17);
 
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
@@ -72,6 +96,184 @@ function distanceM(a, b) {
   const s = Math.sin(dp/2)**2 +
             Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
   return 2*R*Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
+}
+
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function headingRad() {
+  const h = current && Number.isFinite(current.heading) ? current.heading : 0;
+  return rad(h);
+}
+
+function toDisplayXY(lat, lng) {
+  if (!current) return null;
+
+  const cosLat = Math.cos(rad(current.lat));
+  const east  = (lng - current.lng) * 111320 * cosLat;
+  const north = (lat - current.lat) * 110540;
+
+  // Heading-up transform: forward is up on the ESP32 display.
+  const a = headingRad();
+  const forward = east * Math.sin(a) + north * Math.cos(a);
+  const right   = east * Math.cos(a) - north * Math.sin(a);
+
+  const x = Math.round(VIEW_RIDER_X + right / VIEW_METERS_PER_X_UNIT);
+  const y = Math.round(VIEW_RIDER_Y - forward / VIEW_METERS_PER_Y_UNIT);
+
+  return { x, y };
+}
+
+function roadWeight(highway) {
+  const major = new Set([
+    'motorway','motorway_link','trunk','trunk_link',
+    'primary','primary_link','secondary','secondary_link','tertiary'
+  ]);
+  return major.has(highway) ? 2 : 1;
+}
+
+function simplifyDisplayPoints(points, maxPoints) {
+  if (points.length <= maxPoints) return points;
+
+  const out = [];
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.round(i * (points.length - 1) / (maxPoints - 1));
+    out.push(points[idx]);
+  }
+  return out;
+}
+
+async function fetchNearbyRoads(force = false) {
+  if (!current || roadFetchInFlight) return;
+
+  const now = Date.now();
+  const moved = lastRoadFetchPos
+    ? distanceM(current, lastRoadFetchPos)
+    : Infinity;
+
+  if (!force && moved < 70 && (now - lastRoadFetch) < 15000) return;
+
+  roadFetchInFlight = true;
+
+  const query =
+    `[out:json][timeout:12];` +
+    `way(around:${DISPLAY_ROAD_RADIUS_M},${current.lat},${current.lng})[highway];` +
+    `out tags geom;`;
+
+  try {
+    const url =
+      'https://overpass-api.de/api/interpreter?data=' +
+      encodeURIComponent(query);
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Overpass ' + response.status);
+
+    const data = await response.json();
+    nearbyRoadWays = (data.elements || [])
+      .filter(e => e.type === 'way' && e.geometry && e.geometry.length >= 2)
+      .map(e => ({
+        highway: (e.tags && e.tags.highway) || 'road',
+        geometry: e.geometry
+      }));
+
+    // Keep more important roads first if the area contains many tiny ways.
+    nearbyRoadWays.sort((a, b) => roadWeight(b.highway) - roadWeight(a.highway));
+
+    lastRoadFetch = now;
+    lastRoadFetchPos = { lat: current.lat, lng: current.lng };
+    await sendRoadMapToDisplay(true);
+  } catch (e) {
+    console.warn('Nearby-road fetch failed', e);
+  } finally {
+    roadFetchInFlight = false;
+  }
+}
+
+async function sendRoadMapToDisplay(force = false) {
+  if (!rxChar || !current || !nearbyRoadWays.length || roadSendInFlight) return;
+
+  const now = Date.now();
+  if (!force && (now - lastRoadSend) < 3500) return;
+
+  roadSendInFlight = true;
+  lastRoadSend = now;
+
+  try {
+    await writeBle('ROADCLR');
+    await sleep(55);
+
+    let sent = 0;
+
+    for (const way of nearbyRoadWays) {
+      if (sent >= DISPLAY_MAX_ROADS) break;
+
+      const normalized = [];
+      for (const node of way.geometry) {
+        const p = toDisplayXY(node.lat, node.lon);
+
+        // A little overscan prevents roads disappearing at the exact edge.
+        if (p && p.x >= -8 && p.x <= 108 && p.y >= -8 && p.y <= 108) {
+          normalized.push({
+            x: Math.max(0, Math.min(100, p.x)),
+            y: Math.max(0, Math.min(100, p.y))
+          });
+        }
+      }
+
+      if (normalized.length < 2) continue;
+
+      const points = simplifyDisplayPoints(
+        normalized,
+        DISPLAY_MAX_POINTS_PER_ROAD
+      );
+
+      const payload =
+        `ROAD|${roadWeight(way.highway)}|` +
+        points.map(p => `${p.x},${p.y}`).join(';');
+
+      // Keep writes comfortably below our 185-byte BLE MTU.
+      if (new TextEncoder().encode(payload).length < 170) {
+        await writeBle(payload);
+        sent++;
+        await sleep(55);
+      }
+    }
+  } finally {
+    roadSendInFlight = false;
+  }
+}
+
+
+let lastClockSend = 0;
+
+function hhmm(date) {
+  return String(date.getHours()).padStart(2, '0') + ':' +
+         String(date.getMinutes()).padStart(2, '0');
+}
+
+async function sendPhoneClock(force = false) {
+  const now = Date.now();
+  if (!force && now - lastClockSend < 10000) return;
+  lastClockSend = now;
+  await writeBle(`TIME|${hhmm(new Date())}`);
+}
+
+function bearingTo(a, b) {
+  const p1 = rad(a.lat), p2 = rad(b.lat);
+  const dl = rad(b.lng - a.lng);
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) -
+            Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function relativeDestinationBearing() {
+  if (!current || !destination) return 0;
+  const destinationBearing = bearingTo(current, destination);
+  const heading = Number.isFinite(current.heading) ? current.heading : 0;
+  return Math.round((destinationBearing - heading + 360) % 360);
 }
 
 function turnCode(step) {
@@ -118,6 +320,7 @@ document.getElementById('ble').onclick = async () => {
     rxChar = await service.getCharacteristic(RX);
 
     stateEl.textContent = 'Bluetooth ansluten till G30-NAV';
+    await sendPhoneClock(true);
     startGps();
   } catch (e) {
     stateEl.textContent = 'Bluetooth-fel: ' + e.message;
@@ -125,7 +328,7 @@ document.getElementById('ble').onclick = async () => {
 };
 
 document.getElementById('locate').onclick = () => {
-  if (current) map.setView([current.lat, current.lng], 16);
+  if (current) map.setView([current.lat, current.lng], 18);
   startGps();
 };
 
@@ -137,6 +340,31 @@ document.getElementById('clear').onclick = async () => {
   if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
   instrEl.textContent = 'Tryck på kartan för att välja destination.';
   await writeBle('CLR');
+  nearbyRoadWays = [];
+  lastRoadFetch = 0;
+  lastRoadFetchPos = null;
+};
+
+
+document.getElementById('zoomMode').onchange = async (e) => {
+  const mode = e.target.value;
+  if (mode === 'close') {
+    VIEW_METERS_PER_X_UNIT = 1.25;
+    VIEW_METERS_PER_Y_UNIT = 1.20;
+    map.setZoom(19);
+  } else if (mode === 'far') {
+    VIEW_METERS_PER_X_UNIT = 2.6;
+    VIEW_METERS_PER_Y_UNIT = 2.4;
+    map.setZoom(16);
+  } else {
+    VIEW_METERS_PER_X_UNIT = 1.8;
+    VIEW_METERS_PER_Y_UNIT = 1.7;
+    map.setZoom(18);
+  }
+  if (current) {
+    await sendRoadMapToDisplay(true);
+    if (route) await updateNavigation();
+  }
 };
 
 map.on('click', async (e) => {
@@ -165,10 +393,12 @@ function startGps() {
         meMarker = L.circleMarker([current.lat, current.lng], {
           radius:7, color:'#fff', weight:2, fillColor:'#1bc7ad', fillOpacity:1
         }).addTo(map);
-        map.setView([current.lat, current.lng], 16);
+        map.setView([current.lat, current.lng], 18);
       } else {
         meMarker.setLatLng([current.lat, current.lng]);
       }
+
+      await sendPhoneClock(false);
 
       if (destination && route) {
         await updateNavigation();
@@ -210,6 +440,7 @@ async function calculateRoute() {
     }).addTo(map);
 
     await updateNavigation();
+    await fetchNearbyRoads(true);
   } catch (e) {
     instrEl.textContent = 'Ruttfel: ' + e.message;
   }
@@ -239,30 +470,36 @@ function routePreviewPacket() {
   let nearest = 0;
   let best = Infinity;
 
-  // Find nearest route coordinate.
-  for (let i=0; i<coords.length; i+=Math.max(1, Math.floor(coords.length/180))) {
-    const d = distanceM(current, {lat:coords[i][1], lng:coords[i][0]});
-    if (d < best) { best=d; nearest=i; }
+  for (let i = 0; i < coords.length; i += Math.max(1, Math.floor(coords.length / 220))) {
+    const d = distanceM(current, {lat: coords[i][1], lng: coords[i][0]});
+    if (d < best) {
+      best = d;
+      nearest = i;
+    }
   }
 
-  // Show roughly the next 250-350 m, north-up.
-  const points = [];
-  const cosLat = Math.cos(rad(current.lat));
-  const stride = Math.max(1, Math.floor((coords.length - nearest) / 17));
+  const visible = [];
 
-  for (let i=nearest; i<coords.length && points.length<18; i+=stride) {
-    const lon = coords[i][0], lat = coords[i][1];
-    const east = (lon - current.lng) * 111320 * cosLat;
-    const north = (lat - current.lat) * 110540;
+  // Collect the route only inside the close-up map window.
+  for (let i = nearest; i < coords.length; i++) {
+    const p = toDisplayXY(coords[i][1], coords[i][0]);
+    if (!p) continue;
 
-    // 5 m per normalized unit, rider around 50,68.
-    const x = Math.max(0, Math.min(100, Math.round(50 + east / 5)));
-    const y = Math.max(0, Math.min(100, Math.round(68 - north / 5)));
-    points.push(`${x},${y}`);
+    if (p.x >= -8 && p.x <= 108 && p.y >= -8 && p.y <= 108) {
+      visible.push({
+        x: Math.max(0, Math.min(100, p.x)),
+        y: Math.max(0, Math.min(100, p.y))
+      });
+    }
+
+    // Once we are well beyond the visible area ahead, stop walking the route.
+    if (visible.length > 2 && p.y < -25) break;
   }
 
-  if (points.length < 2) return '';
-  return 'MAP|' + points.join(';');
+  if (visible.length < 2) return '';
+
+  const points = simplifyDisplayPoints(visible, 18);
+  return 'MAP|' + points.map(p => `${p.x},${p.y}`).join(';');
 }
 
 async function updateNavigation() {
@@ -278,29 +515,35 @@ async function updateNavigation() {
 
   const code = turnCode(step);
   const road = (step.name || 'Unnamed road').replace(/[|\n\r]/g, ' ').slice(0, 30);
-  const bearing = Math.round(
-    Number.isFinite(current.heading) ? current.heading :
-    (step.maneuver && step.maneuver.bearing_before) || 0
-  );
+  const relativeBearing = relativeDestinationBearing();
 
-  // Remaining ETA approximation from current step onward.
+  // Remaining ETA and distance from the current maneuver onward.
   let remainingSec = 0;
+  let remainingM = 0;
   for (let i=stepIndex; i<route.steps.length; i++) {
     remainingSec += route.steps[i].duration || 0;
+    remainingM += route.steps[i].distance || 0;
   }
   const etaMin = Math.max(0, Math.round(remainingSec / 60));
+  remainingM = Math.max(0, Math.round(remainingM));
+  const arrival = hhmm(new Date(Date.now() + remainingSec * 1000));
 
   instrEl.textContent =
-    `${code} • ${dist} m • ${road} • ETA ${etaMin} min`;
+    `${code} • ${dist} m • ${road} • ETA ${etaMin} min • ${Math.round(remainingM/100)/10} km kvar`;
 
   // Rate-limit BLE updates.
   if (Date.now() - lastBleSend < 700) return;
   lastBleSend = Date.now();
 
-  await writeBle(`NAV|${code}|${dist}|${road}|${bearing}|${etaMin}`);
+  await sendPhoneClock(false);
+  await writeBle(`NAV|${code}|${dist}|${road}|${relativeBearing}|${etaMin}|${remainingM}|${arrival}`);
 
   const mapPacket = routePreviewPacket();
   if (mapPacket) await writeBle(mapPacket);
+
+  // Refresh the heading-up nearby road layer at a slower rate than turn data.
+  await sendRoadMapToDisplay(false);
+  await fetchNearbyRoads(false);
 
   // Re-route if we are clearly away from the route / maneuver path.
   if (dist > 250 && Date.now() - lastRouteRequest > 15000) {
